@@ -10,11 +10,13 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY alembic.ini ./
+COPY alembic.ini pytest.ini ./
 COPY alembic ./alembic
 COPY app ./app
 COPY worker ./worker
 COPY scripts ./scripts
+# Tests ship in the image so `docker compose run --rm api pytest` works as-is.
+COPY tests ./tests
 
 RUN chmod +x ./scripts/*.sh \
     && useradd --create-home --uid 1000 appuser \

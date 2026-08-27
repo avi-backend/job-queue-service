@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from app import __version__
+from app.api.jobs import router as jobs_router
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
 from app.db.session import dispose_engine
@@ -40,6 +41,8 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+
+app.include_router(jobs_router)
 
 
 @app.get("/", response_model=ServiceInfo, tags=["service"])
