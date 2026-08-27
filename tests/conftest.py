@@ -13,23 +13,30 @@ import asyncio
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import app
+from app.services.queue_service import ReadyQueue
+from worker.runner import JobRunner
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAINTENANCE_DATABASE = "postgres"
+
+#: Kept away from the development database index so a test run cannot wipe it.
+TEST_REDIS_DB = 15
 
 
 def _test_database_url() -> URL:
@@ -41,6 +48,17 @@ def _test_database_url() -> URL:
 
 
 TEST_URL = _test_database_url()
+
+
+def _test_redis_url() -> str:
+    override = os.getenv("TEST_REDIS_URL")
+    if override:
+        return override
+    base = settings.redis_url.rsplit("/", 1)[0]
+    return f"{base}/{TEST_REDIS_DB}"
+
+
+TEST_REDIS_URL = _test_redis_url()
 
 
 async def _create_database_if_missing(url: URL) -> None:
@@ -116,9 +134,49 @@ async def session(
         yield db_session
 
 
+async def instant_sleep(seconds: float) -> None:
+    """Stand-in for asyncio.sleep so simulated work costs no wall-clock time."""
+
+
+@pytest.fixture
+def make_runner(
+    session_factory: async_sessionmaker[AsyncSession], ready_queue: ReadyQueue
+) -> Callable[..., JobRunner]:
+    """Build workers whose sleeps are instant and whose randomness is fixed."""
+
+    def build(worker_id: str = "worker-1", random_value: float = 0.0) -> JobRunner:
+        return JobRunner(
+            session_factory=session_factory,
+            ready_queue=ready_queue,
+            worker_id=worker_id,
+            poll_interval=0.01,
+            sleep=instant_sleep,
+            random_source=lambda: random_value,
+        )
+
+    return build
+
+
+@pytest.fixture
+async def redis() -> AsyncIterator[Redis]:
+    """Redis on a dedicated database index, emptied before each test."""
+    client = Redis.from_url(TEST_REDIS_URL, encoding="utf-8", decode_responses=True)
+    await client.flushdb()
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+@pytest.fixture
+def ready_queue(redis: Redis) -> ReadyQueue:
+    return ReadyQueue(redis)
+
+
 @pytest.fixture
 async def client(
     session_factory: async_sessionmaker[AsyncSession],
+    redis: Redis,
 ) -> AsyncIterator[AsyncClient]:
     """API client whose requests each get their own database session."""
 
@@ -130,7 +188,11 @@ async def client(
                 await request_session.rollback()
                 raise
 
+    async def override_get_redis() -> Redis:
+        return redis
+
     app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_redis] = override_get_redis
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client

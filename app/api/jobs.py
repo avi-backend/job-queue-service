@@ -4,8 +4,10 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.redis import get_redis
 from app.db.models import JobStatus
 from app.db.session import get_session
 from app.schemas.jobs import (
@@ -17,8 +19,13 @@ from app.schemas.jobs import (
     JobType,
 )
 from app.services import job_service
+from app.services.queue_service import ReadyQueue
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+async def get_ready_queue(redis: Annotated[Redis, Depends(get_redis)]) -> ReadyQueue:
+    return ReadyQueue(redis)
 
 IdempotencyKey = Annotated[
     str | None,
@@ -47,9 +54,10 @@ async def create_job(
     request: JobCreateRequest,
     response: Response,
     session: Annotated[AsyncSession, Depends(get_session)],
+    ready_queue: Annotated[ReadyQueue, Depends(get_ready_queue)],
     idempotency_key: IdempotencyKey = None,
 ) -> JobResponse:
-    job, created = await job_service.create_job(session, request, idempotency_key)
+    job, created = await job_service.submit_job(session, ready_queue, request, idempotency_key)
     if not created:
         response.status_code = status.HTTP_200_OK
     return JobResponse.model_validate(job)

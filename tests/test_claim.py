@@ -1,0 +1,167 @@
+"""The atomic claim is the ownership boundary, so it is tested against real PostgreSQL."""
+
+import asyncio
+import uuid
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.core.time import utcnow
+from app.db.models import Job, JobStatus
+from app.services import job_service
+
+WORKER = "worker-a"
+
+
+async def _insert_job(
+    session: AsyncSession, status: JobStatus = JobStatus.PENDING, **overrides
+) -> Job:
+    job = Job(
+        type="email",
+        payload={"to": "user@example.com", "subject": "Hello", "body": None},
+        status=status,
+        **overrides,
+    )
+    session.add(job)
+    await session.commit()
+    return job
+
+
+async def test_claim_transitions_pending_to_processing(session: AsyncSession) -> None:
+    job = await _insert_job(session)
+
+    claimed = await job_service.claim_job(session, job.id, WORKER)
+
+    assert claimed is not None
+    assert claimed.status is JobStatus.PROCESSING
+    assert claimed.worker_id == WORKER
+    assert claimed.started_at is not None
+    assert claimed.attempt_count == 1
+
+
+async def test_claim_increments_attempt_count_exactly_once(session: AsyncSession) -> None:
+    job = await _insert_job(session)
+
+    await job_service.claim_job(session, job.id, WORKER)
+
+    stored = await session.scalar(select(Job.attempt_count).where(Job.id == job.id))
+    assert stored == 1
+
+
+async def test_second_worker_cannot_claim_a_claimed_job(session: AsyncSession) -> None:
+    job = await _insert_job(session)
+
+    first = await job_service.claim_job(session, job.id, WORKER)
+    second = await job_service.claim_job(session, job.id, "worker-b")
+
+    assert first is not None
+    assert second is None
+    stored = (await session.execute(select(Job).where(Job.id == job.id))).scalars().one()
+    await session.refresh(stored)
+    assert stored.worker_id == WORKER
+    assert stored.attempt_count == 1
+
+
+@pytest.mark.parametrize(
+    "status",
+    [JobStatus.SCHEDULED, JobStatus.PROCESSING, JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED],
+)
+async def test_only_pending_jobs_can_be_claimed(
+    session: AsyncSession, status: JobStatus
+) -> None:
+    job = await _insert_job(session, status=status)
+
+    assert await job_service.claim_job(session, job.id, WORKER) is None
+
+
+async def test_claiming_an_unknown_job_returns_none(session: AsyncSession) -> None:
+    assert await job_service.claim_job(session, uuid.uuid4(), WORKER) is None
+
+
+async def test_claim_refuses_to_exceed_max_attempts(session: AsyncSession) -> None:
+    """Guards the attempt_count <= max_attempts constraint from Phase 1."""
+    job = await _insert_job(session, attempt_count=3, max_attempts=3)
+
+    assert await job_service.claim_job(session, job.id, WORKER) is None
+
+
+async def test_concurrent_claims_yield_exactly_one_winner(
+    session: AsyncSession, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Eight workers race for one job; PostgreSQL must pick a single owner."""
+    job = await _insert_job(session)
+
+    async def claim(worker_id: str) -> Job | None:
+        async with session_factory() as worker_session:
+            return await job_service.claim_job(worker_session, job.id, worker_id)
+
+    results = await asyncio.gather(*(claim(f"worker-{index}") for index in range(8)))
+
+    winners = [claimed for claimed in results if claimed is not None]
+    assert len(winners) == 1
+
+    await session.refresh(job)
+    assert job.status is JobStatus.PROCESSING
+    assert job.attempt_count == 1
+    assert job.worker_id == winners[0].worker_id
+
+
+async def test_complete_job_stores_result_and_completion_time(session: AsyncSession) -> None:
+    job = await _insert_job(session)
+    await job_service.claim_job(session, job.id, WORKER)
+
+    completed = await job_service.complete_job(session, job.id, {"status": "sent"})
+
+    assert completed is not None
+    assert completed.status is JobStatus.COMPLETED
+    assert completed.result == {"status": "sent"}
+    assert completed.progress == 100
+    assert completed.completed_at is not None
+    assert completed.error is None
+    assert completed.lease_expires_at is None
+
+
+async def test_fail_job_stores_error_and_completion_time(session: AsyncSession) -> None:
+    job = await _insert_job(session)
+    await job_service.claim_job(session, job.id, WORKER)
+
+    failed = await job_service.fail_job(session, job.id, "delivery failed")
+
+    assert failed is not None
+    assert failed.status is JobStatus.FAILED
+    assert failed.error == "delivery failed"
+    assert failed.completed_at is not None
+    assert failed.attempt_count == 1
+
+
+async def test_terminal_transitions_require_processing(session: AsyncSession) -> None:
+    """A pending job cannot be completed or failed without being claimed first."""
+    job = await _insert_job(session)
+
+    assert await job_service.complete_job(session, job.id, {}) is None
+    assert await job_service.fail_job(session, job.id, "nope") is None
+
+
+async def test_progress_updates_only_apply_while_processing(session: AsyncSession) -> None:
+    job = await _insert_job(session)
+
+    await job_service.update_progress(session, job.id, 50)
+    await session.refresh(job)
+    assert job.progress == 0
+
+    await job_service.claim_job(session, job.id, WORKER)
+    await job_service.update_progress(session, job.id, 50)
+    await session.refresh(job)
+    assert job.progress == 50
+
+
+async def test_started_at_is_preserved_across_claims(session: AsyncSession) -> None:
+    """COALESCE keeps the original start time when a job is claimed again later."""
+    original = utcnow()
+    job = await _insert_job(session, started_at=original)
+
+    claimed = await job_service.claim_job(session, job.id, WORKER)
+
+    assert claimed is not None
+    assert claimed.started_at == original

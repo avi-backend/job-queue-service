@@ -10,6 +10,7 @@ from app import __version__
 from app.api.jobs import router as jobs_router
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
+from app.core.redis import close_redis
 from app.db.session import dispose_engine
 
 logger = get_logger(__name__)
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     logger.info("api starting", extra={"environment": settings.environment})
     yield
+    await close_redis()
     await dispose_engine()
     logger.info("api stopped")
 

@@ -29,6 +29,9 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://redis:6379/0"
 
+    #: How long a worker waits before polling the ready queue again.
+    worker_poll_interval_seconds: float = Field(default=1.0, gt=0)
+
     @property
     def sync_database_url(self) -> str:
         """Driver-less URL for tools that require a synchronous DBAPI."""
