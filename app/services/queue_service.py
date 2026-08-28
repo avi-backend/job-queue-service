@@ -158,6 +158,18 @@ class ReadyQueue:
         )
         return bool(removed)
 
+    async def remove_current(self, job_id: uuid.UUID) -> bool:
+        """Remove the job's current queue entry, if it has one.
+
+        Looks up the token in the entry mapping and then compare-and-deletes
+        that exact member. A concurrent re-enqueue replaces the mapping first,
+        so this cannot delete a newer entry for the same job.
+        """
+        member = await self.current_member(job_id)
+        if member is None:
+            return False
+        return await self.remove(QueueCandidate.from_member(member))
+
     async def size(self) -> int:
         return int(await self._redis.zcard(READY_QUEUE_KEY))
 

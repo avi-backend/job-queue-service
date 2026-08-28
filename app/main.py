@@ -2,16 +2,22 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Response, status
 from pydantic import BaseModel
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import __version__
 from app.api.jobs import router as jobs_router
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
-from app.core.redis import close_redis
-from app.db.session import dispose_engine
+from app.core.redis import close_redis, get_redis
+from app.db.session import dispose_engine, get_session
+from app.schemas.health import HealthResponse
+from app.services.health import HEALTHY, collect_health
+from app.services.queue_service import ReadyQueue
 
 logger = get_logger(__name__)
 
@@ -21,10 +27,6 @@ class ServiceInfo(BaseModel):
     version: str
     status: str
     docs: str
-
-
-class HealthResponse(BaseModel):
-    status: str
 
 
 @asynccontextmanager
@@ -57,7 +59,29 @@ async def root() -> ServiceInfo:
     )
 
 
-@app.get("/health", response_model=HealthResponse, tags=["service"])
-async def health() -> HealthResponse:
-    """Liveness only. Dependency and queue statistics land in a later phase."""
-    return HealthResponse(status="ok")
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["service"],
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": HealthResponse,
+            "description": "PostgreSQL or Redis is unreachable.",
+        }
+    },
+)
+async def health(
+    response: Response,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    redis: Annotated[Redis, Depends(get_redis)],
+) -> HealthResponse:
+    """Dependency health plus queue and job-status counts.
+
+    A mismatch between Redis `ready` and PostgreSQL `pending` is reported as-is
+    and does not make the service unhealthy: Redis is an index, not the source
+    of truth.
+    """
+    report = await collect_health(session, ReadyQueue(redis))
+    if report.status != HEALTHY:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return report

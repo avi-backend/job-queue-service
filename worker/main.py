@@ -11,9 +11,10 @@ gives three of each. Nothing coordinates them at the process level; the atomic
 database transitions inside each loop are the only thing preventing duplicate
 activation or duplicate recovery.
 
-A signal stops all three. Finishing an in-flight job before exit is Phase 4B; a
-job interrupted by shutdown today keeps its lease until it expires, and crash
-recovery retries it.
+SIGTERM/SIGINT stop accepting new work: the runner will not claim another job,
+and the scheduler and recovery loops will not start another sweep. An attempt
+already owned by this process is drained to completion with its heartbeat still
+running, then the process exits. SIGKILL is a crash; lease recovery handles it.
 """
 
 import asyncio
@@ -35,10 +36,15 @@ logger = get_logger("worker")
 async def run() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
-
     worker_id = build_worker_id()
+
+    def request_stop() -> None:
+        if not stop.is_set():
+            logger.info("worker_shutdown_requested", extra={"worker_id": worker_id})
+        stop.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, request_stop)
     ready_queue = ReadyQueue(redis_client)
 
     runner = JobRunner(

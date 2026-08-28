@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.errors import OwnershipLostError
+from app.core.errors import JobConflictError, JobNotFoundError, OwnershipLostError
 from app.core.logging import get_logger
 from app.core.time import to_utc, utcnow
 from app.db.models import Job, JobStatus
@@ -559,3 +559,132 @@ async def list_jobs(
     page = page.order_by(Job.created_at.desc(), Job.id.desc()).limit(limit).offset(offset)
     rows = (await session.execute(page)).scalars().all()
     return rows, total or 0
+
+
+#: Statuses the assignment allows a caller to cancel.
+_CANCELLABLE = (JobStatus.PENDING, JobStatus.SCHEDULED)
+
+
+async def _remove_ready_entry(ready_queue: ReadyQueue, job_id: uuid.UUID, context: dict) -> None:
+    """Drop the current Redis entry after a durable state change.
+
+    Failures are logged, not raised: PostgreSQL already decided the job's state,
+    and a leftover index entry cannot be claimed because the claim requires
+    PENDING. Compare-and-delete targets the current token, so this cannot
+    delete a later entry for a different generation of the same job.
+    """
+    try:
+        removed = await ready_queue.remove_current(job_id)
+    except Exception:
+        logger.exception("job_queue_cleanup_failed", extra=context)
+        return
+    if removed:
+        logger.info("job_queue_entry_removed", extra=context)
+
+
+async def cancel_job(session: AsyncSession, ready_queue: ReadyQueue, job_id: uuid.UUID) -> Job:
+    """Atomically cancel a PENDING or SCHEDULED job.
+
+    The UPDATE is the concurrency boundary against a worker claim: only one of
+    PENDING -> CANCELLED and PENDING -> PROCESSING can win. A later claim of a
+    cancelled job matches zero rows, even if a stale Redis entry remains.
+
+    Cancelling an already-cancelled job is idempotent and returns the existing
+    row. PROCESSING, COMPLETED and FAILED are conflicts: an in-flight attempt
+    must finish under its owner, and a finished job is not undone here.
+    """
+    statement = (
+        update(Job)
+        .where(Job.id == job_id, Job.status.in_(_CANCELLABLE))
+        .values(
+            status=JobStatus.CANCELLED,
+            **_RELEASED_OWNERSHIP,
+        )
+        .returning(Job)
+        .execution_options(synchronize_session=False, populate_existing=True)
+    )
+    job = (await session.execute(statement)).scalars().first()
+    await session.commit()
+
+    if job is not None:
+        context = {"job_id": str(job.id), "job_type": job.type, "job_status": job.status.value}
+        logger.info("job_cancelled", extra=context)
+        await _remove_ready_entry(ready_queue, job.id, context)
+        return job
+
+    existing = await get_job(session, job_id)
+    if existing is None:
+        raise JobNotFoundError(job_id)
+    if existing.status is JobStatus.CANCELLED:
+        logger.info(
+            "job_cancel_idempotent",
+            extra={"job_id": str(job_id), "job_status": existing.status.value},
+        )
+        return existing
+    raise JobConflictError(job_id, "cancel", existing.status.value)
+
+
+async def retry_job(session: AsyncSession, ready_queue: ReadyQueue, job_id: uuid.UUID) -> Job:
+    """Start a new three-attempt cycle for a FAILED job.
+
+    Manual retry is a new cycle, not a fourth attempt: attempt_count goes back
+    to 0 so the existing `attempt_count <= max_attempts` constraint stays
+    satisfied and the job gets the same 30s/120s policy as a fresh submission.
+    Previous attempts remain in job_logs and in the structured logs.
+
+    PostgreSQL is committed first. A Redis enqueue failure leaves the job
+    durably PENDING and is logged the same way as a failed submit or scheduler
+    publish; it is not rolled back.
+    """
+    statement = (
+        update(Job)
+        .where(Job.id == job_id, Job.status == JobStatus.FAILED)
+        .values(
+            status=JobStatus.PENDING,
+            attempt_count=0,
+            progress=0,
+            error=None,
+            result=None,
+            completed_at=None,
+            started_at=None,
+            scheduled_at=None,
+            **_RELEASED_OWNERSHIP,
+        )
+        .returning(Job)
+        .execution_options(synchronize_session=False, populate_existing=True)
+    )
+    job = (await session.execute(statement)).scalars().first()
+    await session.commit()
+
+    if job is None:
+        existing = await get_job(session, job_id)
+        if existing is None:
+            raise JobNotFoundError(job_id)
+        raise JobConflictError(job_id, "retry", existing.status.value)
+
+    context = {
+        "job_id": str(job.id),
+        "job_type": job.type,
+        "priority": job.priority,
+        "attempt": job.attempt_count,
+    }
+    logger.info("job_retried", extra=context)
+    try:
+        candidate = await ready_queue.enqueue(job.id, job.priority)
+    except Exception:
+        logger.exception(
+            "job_retry_enqueue_failed",
+            extra={**context, "detail": "job is PENDING in postgres but not visible to workers"},
+        )
+    else:
+        logger.info("job_enqueued", extra={**context, "queue_entry": candidate.member})
+    return job
+
+
+async def count_jobs_by_status(session: AsyncSession) -> dict[str, int]:
+    """Count jobs per status in the database. Does not load the rows."""
+    counts = {status.value: 0 for status in JobStatus}
+    rows = await session.execute(select(Job.status, func.count()).group_by(Job.status))
+    for status, total in rows:
+        counts[status.value] = int(total)
+    return counts

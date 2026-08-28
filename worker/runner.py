@@ -67,12 +67,12 @@ class JobRunner:
         self._random = random_source
 
     async def run_forever(self, stop: asyncio.Event) -> None:
-        """Poll until asked to stop, backing off when there is nothing to do."""
+        """Poll until asked to stop, then drain any in-flight attempt."""
         logger.info("worker_started", extra={"worker_id": self._worker_id})
 
         while not stop.is_set():
             try:
-                did_work = await self.run_once()
+                did_work = await self.run_once(stop)
             except Exception:
                 logger.exception("worker_cycle_failed", extra={"worker_id": self._worker_id})
                 did_work = False
@@ -84,11 +84,31 @@ class JobRunner:
 
         logger.info("worker_stopped", extra={"worker_id": self._worker_id})
 
-    async def run_once(self) -> bool:
-        """Execute at most one job. Returns whether a job was executed."""
+    async def run_once(self, stop: asyncio.Event | None = None) -> bool:
+        """Execute at most one job. Returns whether a job was executed.
+
+        `stop` is checked before every claim. Once it is set the runner will
+        still finish an attempt it already owns (heartbeat included), but it
+        will not take another job. Peeking a candidate and then seeing `stop`
+        leaves that entry in Redis for someone else.
+        """
         for _ in range(MAX_CANDIDATES_PER_CYCLE):
+            if stop is not None and stop.is_set():
+                return False
+
             candidate = await self._queue.peek()
             if candidate is None:
+                return False
+
+            if stop is not None and stop.is_set():
+                logger.info(
+                    "job_claim_skipped_for_shutdown",
+                    extra={
+                        "job_id": str(candidate.job_id),
+                        "worker_id": self._worker_id,
+                        "queue_entry": candidate.member,
+                    },
+                )
                 return False
 
             logger.debug(

@@ -170,3 +170,43 @@ _To be completed._
   lease, `NULL < now()` is unknown, and recovery would leave those rows stuck.
   The upgrade has to release them itself. Caught before commit by reviewing
   the 0002 data step against the recovery predicate.
+
+## Phase 4B notes
+
+- Cancellation is one conditional `UPDATE` (`pending`/`scheduled` -> `cancelled`).
+  A `SELECT` then unconditional `UPDATE` would lose the race against claim.
+  `processing` is never cancelled: the live owner must finish or be recovered.
+- Cancelling an already-cancelled job is idempotent (`200`). Treating it as
+  `409` would punish clients that retry a lost response. `completed` and
+  `failed` stay conflicts because those are real state changes, not repeats.
+- Redis cleanup after cancel uses `remove_current` (lookup token, then
+  compare-and-delete). A leftover entry after a Redis failure cannot execute:
+  claim still requires `pending`.
+- Manual retry resets `attempt_count` to 0. Keeping the exhausted count would
+  violate `attempt_count <= max_attempts` on the next claim, or require raising
+  `max_attempts`. A new cycle is the assignment's preferred reading and matches
+  the existing three-attempt policy. Job logs keep the earlier history.
+- Manual retry, submit and scheduler all commit PostgreSQL before Redis and
+  log enqueue failure rather than rolling back. Same window, same honesty.
+- Graceful shutdown stops new claims and new scheduler/recovery sweeps, then
+  drains the owned attempt with the heartbeat still running. Cancelling the
+  handler on SIGTERM would abandon work the process can still finish and would
+  conflate process shutdown with ownership loss.
+- Compose `stop_grace_period: 2m` is a Docker wait, not an application timeout.
+  Expiry of that window is SIGKILL, i.e. the crash path.
+- `/health` reports Redis `ready` and PostgreSQL status counts independently.
+  `completed` is included so the response is a full census, not only a backlog.
+  A `pending`/`ready` mismatch is not unhealthiness. Either store down is `503`.
+
+### AI suggestions that failed under analysis (Phase 4B)
+
+- Suggested: return `409` for every non-cancellable status, including an
+  already-cancelled job. Rejected for the lost-response case: the client would
+  be told a successful cancel had failed.
+- Suggested: cancel `processing` by setting a flag the handler checks. Out of
+  scope (assignment forbids processing cancel) and would not recall external
+  side effects anyway.
+- Suggested: roll back a manual retry if Redis enqueue fails, so the API never
+  returns PENDING without a queue entry. Same false two-store transaction as
+  submit: a Redis timeout of unknown outcome can double-enqueue on retry of
+  the rollback. PostgreSQL stays authoritative; `/health` shows the gap.

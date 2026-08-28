@@ -93,6 +93,10 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    # Long enough for a draining attempt to finish and persist. Not an
+    # application timeout: SIGKILL after this window is the same crash path
+    # as any other hard kill, and lease recovery retries the job.
+    stop_grace_period: 2m
     restart: unless-stopped
 
 volumes:

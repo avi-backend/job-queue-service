@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import JobConflictError, JobNotFoundError
 from app.core.redis import get_redis
 from app.db.models import JobStatus
 from app.db.session import get_session
@@ -95,4 +96,64 @@ async def get_job(
     job = await job_service.get_job(session, job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+    return JobResponse.model_validate(job)
+
+
+def _translate_mutation(error: JobNotFoundError | JobConflictError) -> HTTPException:
+    if isinstance(error, JobNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"cannot {error.action} a job that is {error.status}",
+    )
+
+
+@router.post(
+    "/{job_id}/cancel",
+    response_model=JobResponse,
+    summary="Cancel a pending or scheduled job",
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "Job not found."},
+        status.HTTP_409_CONFLICT: {
+            "description": "Job is processing, completed or failed and cannot be cancelled."
+        },
+    },
+)
+async def cancel_job(
+    job_id: uuid.UUID,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ready_queue: Annotated[ReadyQueue, Depends(get_ready_queue)],
+) -> JobResponse:
+    """Cancel PENDING or SCHEDULED work.
+
+    Already-cancelled jobs return the existing row (idempotent 200). An in-flight
+    or finished job is a 409: cancellation is not allowed to interrupt a live
+    attempt or undo a terminal result.
+    """
+    try:
+        job = await job_service.cancel_job(session, ready_queue, job_id)
+    except (JobNotFoundError, JobConflictError) as error:
+        raise _translate_mutation(error) from error
+    return JobResponse.model_validate(job)
+
+
+@router.post(
+    "/{job_id}/retry",
+    response_model=JobResponse,
+    summary="Manually retry a failed job",
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "Job not found."},
+        status.HTTP_409_CONFLICT: {"description": "Only failed jobs can be retried."},
+    },
+)
+async def retry_job(
+    job_id: uuid.UUID,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ready_queue: Annotated[ReadyQueue, Depends(get_ready_queue)],
+) -> JobResponse:
+    """Re-queue a FAILED job as a new three-attempt cycle (`attempt_count = 0`)."""
+    try:
+        job = await job_service.retry_job(session, ready_queue, job_id)
+    except (JobNotFoundError, JobConflictError) as error:
+        raise _translate_mutation(error) from error
     return JobResponse.model_validate(job)

@@ -5,12 +5,11 @@ state; Redis is used only as the ready-job delivery queue.
 
 Author: Avi
 
-> Status: Phase 4A. Job submission, the Redis ready queue, atomic claiming,
-> worker execution, execution-token fencing, processing leases with heartbeats,
-> retry with backoff, scheduled-job activation and worker crash recovery are
-> implemented, and multiple workers can run concurrently. Cancellation, a manual
-> retry endpoint, queue statistics on `/health`, a dead letter queue, hard
-> execution timeouts and authentication are **not** implemented yet.
+> Status: Phase 4B. Submission, claiming, fencing, leases, retries, scheduling,
+> crash recovery, cancellation of pending/scheduled jobs, manual retry of failed
+> jobs, graceful worker drain and `/health` queue statistics are implemented.
+> A dead letter queue, hard execution timeouts and authentication are **not**
+> implemented.
 
 ## Requirements
 
@@ -208,7 +207,9 @@ Full request and response schemas are browsable in Swagger UI at
 | `POST` | `/jobs` | Submit a job. `201` when created, `200` when an idempotency key replays an existing job. |
 | `GET` | `/jobs/{job_id}` | Fetch one job. `404` if unknown. |
 | `GET` | `/jobs` | List jobs, newest first. Filters: `status`, `type`. Pagination: `limit` (max 100, default 50), `offset`. |
-| `GET` | `/health` | Liveness only; queue statistics come in a later phase. |
+| `POST` | `/jobs/{job_id}/cancel` | Cancel a `pending` or `scheduled` job. Idempotent for an already-cancelled job (`200`). `409` if processing, completed or failed. `404` if unknown. |
+| `POST` | `/jobs/{job_id}/retry` | Re-queue a `failed` job as a new three-attempt cycle (`attempt_count = 0`). `409` otherwise. `404` if unknown. |
+| `GET` | `/health` | PostgreSQL and Redis probes plus queue/job-status counts. `503` if either store is unreachable. |
 
 Job types are `email`, `webhook`, `report` and `batch`, each with a payload
 validated against its own schema before the job is persisted. `priority` accepts
@@ -223,8 +224,9 @@ once the key expires it can be reused for a new job.
 A new `pending` job is committed to PostgreSQL and then published to the ready
 queue. A `scheduled` job is only persisted, and an idempotency replay never
 enqueues again. If the Redis publish fails after the commit, the job stays
-durably `pending` but invisible to workers until a reconciliation sweep (a later
-phase) re-queues it; the failure is logged as `job_enqueue_failed`.
+durably `pending` but invisible to workers until something re-queues it; the
+failure is logged as `job_enqueue_failed`. `/health` reports `pending` and
+`ready` separately so that window is visible.
 
 ## Job execution
 
@@ -239,10 +241,56 @@ returns it to `pending`; the final failure goes `processing` -> `failed`.
 Ownership fields (`worker_id`, `execution_token`, `lease_expires_at`) are cleared
 whenever a job leaves `processing`, so they only ever describe a live attempt.
 
-Workers respond to `SIGTERM`/`SIGINT` by stopping all three loops. Waiting for an
-in-flight job to finish before exiting is part of Phase 4B; today a job
-interrupted by shutdown keeps its lease until it expires and is then recovered,
-which is exactly the crash path.
+### Cancellation
+
+`POST /jobs/{id}/cancel` is a single conditional `UPDATE` that accepts only
+`pending` or `scheduled`. The database transition is the race against a worker
+claim: if cancel wins, the claim matches zero rows; if the claim wins, cancel
+returns `409`. `processing` jobs are never cancelled, because an in-flight
+attempt must finish under its owner (or be recovered when its lease expires).
+
+Cancelling a job that is already `cancelled` returns the existing row with
+`200`. That is the one idempotent case; `completed` and `failed` are conflicts.
+
+A cancelled `pending` job has its *current* Redis entry removed by token. If
+that cleanup fails, the job stays durably `cancelled` and the leftover entry
+cannot be claimed. Correctness does not depend on Redis.
+
+### Manual retry
+
+`POST /jobs/{id}/retry` accepts only `failed` jobs. It transitions
+`failed -> pending`, resets `attempt_count` to 0 (a new three-attempt cycle,
+so the `attempt_count <= max_attempts` constraint stays valid), and clears
+`error`, `result`, `progress`, `completed_at`, `started_at`, `scheduled_at` and
+the ownership fields. `max_attempts` stays 3. Previous attempts remain in
+structured logs.
+
+PostgreSQL is committed first. A Redis enqueue failure is logged as
+`job_retry_enqueue_failed` and leaves the job durably `pending`, the same
+window as submit and scheduler publish.
+
+### Graceful shutdown
+
+`SIGTERM`/`SIGINT` stop the worker accepting new work: no further claims, and
+no new scheduler or recovery sweep. An attempt this process already owns is
+drained to completion with its heartbeat still running, then the process
+exits. Compose gives the worker a `stop_grace_period` of two minutes so
+`docker stop` can wait for that drain. There is no application-level hard
+timeout; a `SIGKILL` (or a grace period that expires) is the crash path and
+lease recovery retries the abandoned attempt.
+
+Ownership-loss cancellation of the handler is unchanged and separate: that is
+what happens when recovery takes the job away, not when the process is asked
+to shut down.
+
+### Health
+
+`GET /health` probes PostgreSQL (`SELECT 1` plus a `GROUP BY status` count) and
+Redis (`ReadyQueue.size()`). Both counts are reported honestly. `ready`
+(Redis) and `pending` (PostgreSQL) may differ; that mismatch is the documented
+enqueue window and does not mark the service unhealthy. `completed` is included
+so the response shows throughput, not only backlog. Either store unreachable
+yields `503` with the failing component set to `unhealthy`.
 
 ## Crash-recovery demonstration
 

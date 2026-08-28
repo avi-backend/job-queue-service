@@ -3,6 +3,24 @@
 import uuid
 
 
+class JobNotFoundError(LookupError):
+    """Raised when an API mutation names a job that does not exist."""
+
+    def __init__(self, job_id: uuid.UUID) -> None:
+        super().__init__(f"job {job_id} not found")
+        self.job_id = job_id
+
+
+class JobConflictError(RuntimeError):
+    """Raised when a job exists but is not in a state that allows the mutation."""
+
+    def __init__(self, job_id: uuid.UUID, action: str, status: str) -> None:
+        super().__init__(f"cannot {action} job {job_id} while it is {status}")
+        self.job_id = job_id
+        self.action = action
+        self.status = status
+
+
 class OwnershipLostError(RuntimeError):
     """Raised when a worker writes to a job it no longer owns.
 
