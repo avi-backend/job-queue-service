@@ -1,330 +1,308 @@
 # Job Queue Service
 
-Distributed job queue service. PostgreSQL is the durable source of truth for job
-state; Redis is used only as the ready-job delivery queue.
+A distributed job queue. Clients submit work through an HTTP API; worker
+processes claim and execute it. PostgreSQL is the durable source of truth for
+every job. Redis is only a ready-work index: appearing in it grants no
+ownership.
+
+Execution is **at-least-once**. A stalled or killed worker may already have had
+an external effect before its attempt is recovered. The service guarantees that
+only one attempt can write job state at a time, not that handlers run exactly
+once.
 
 Author: Avi
 
-> Status: Phase 4B. Submission, claiming, fencing, leases, retries, scheduling,
-> crash recovery, cancellation of pending/scheduled jobs, manual retry of failed
-> jobs, graceful worker drain and `/health` queue statistics are implemented.
-> A dead letter queue, hard execution timeouts and authentication are **not**
-> implemented.
+## Architecture
 
-## Requirements
+```
+Client ──► FastAPI ──► PostgreSQL (job state)
+                │
+                └──► Redis ZSET (ready index)
 
-- Docker and Docker Compose
-
-## Running
-
-```bash
-docker compose up --build
+Worker process (N replicas)
+  ├── runner      peek Redis → atomic PENDING→PROCESSING claim → execute
+  ├── scheduler   due SCHEDULED → PENDING → enqueue
+  └── recovery    expired PROCESSING leases → retry or fail
 ```
 
-The API is available on <http://localhost:8000>, with Swagger UI at
-<http://localhost:8000/docs>.
+A worker owns a job only after a single conditional `UPDATE` moves it from
+`pending` to `processing`. Pickup is peek-then-claim: the Redis entry is read
+without removing it, the database claim is attempted, and only then is the
+observed queue token deleted. Popping Redis first would lose the job if the
+worker died before durable ownership existed.
+
+Ready-queue ordering keeps priority and FIFO in separate places. The score is
+`100 - priority` and nothing else, so higher priority always sorts first. FIFO
+within a priority comes from a zero-padded sequence in the member
+(`0000000000000000123:<job-uuid>`), which Redis compares lexicographically when
+scores tie. Workers remove the exact token they observed, so a late cleanup
+cannot delete a newer entry for the same job.
+
+## Technology stack
+
+| Piece | Choice |
+| --- | --- |
+| Language | Python 3.12 |
+| API | FastAPI |
+| Database | PostgreSQL 16 |
+| Ready index | Redis 7 sorted set |
+| Migrations | Alembic |
+| Workers | Separate process, same image |
+| Runtime | Docker Compose |
+
+## Run from a fresh clone
+
+Compose defaults are enough. A local `.env` is optional.
+
+```bash
+git clone https://github.com/avi-backend/job-queue-service.git
+cd job-queue-service
+docker compose up --build -d
+```
+
+Wait until the API is healthy, then:
+
+```bash
+curl -s http://localhost:8000/
+curl -s http://localhost:8000/health
+```
+
+Swagger UI is at <http://localhost:8000/docs>.
+
+Stop everything with `docker compose down`. Add `-v` only if you also want to
+discard the database volume.
+
+## Migrations
 
 A one-shot `migrate` service runs `alembic upgrade head` and must exit
-successfully before the API and worker start. Revision `0002` adds the fencing
-token and also releases any Phase 3 `processing` row that has no token or lease:
-those rows cannot be recovered (`NULL < now()` is unknown), so the upgrade
-moves them to `scheduled` with `scheduled_at = now()` and preserves
-`attempt_count`. To run migrations manually:
+successfully before the API and worker start. That keeps a single schema writer
+and lets the worker start independently of API health.
 
 ```bash
 docker compose run --rm migrate
 ```
 
-## Configuration
+Revision `0002` adds `execution_token` and releases any pre-token `processing`
+row that has no lease. Those rows cannot be recovered (`NULL < now()` is
+unknown), so the upgrade moves them to `scheduled` with `scheduled_at = now()`
+and preserves `attempt_count`.
 
-Copy `.env.example` to `.env` to override defaults. Compose has working defaults
-for local development, so a `.env` file is optional.
-
-Distributed-safety timings:
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `JOB_LEASE_SECONDS` | `60` | How long a claim owns a job before recovery may take it |
-| `JOB_HEARTBEAT_SECONDS` | `20` | Lease extension interval; must be smaller than the lease |
-| `SCHEDULER_INTERVAL_SECONDS` | `1` | How often each worker looks for due scheduled jobs |
-| `SCHEDULER_BATCH_SIZE` | `100` | Maximum jobs activated per scheduler pass |
-| `RECOVERY_INTERVAL_SECONDS` | `5` | How often each worker looks for expired leases |
-| `RECOVERY_BATCH_SIZE` | `100` | Maximum jobs recovered per pass |
-| `WORKER_POLL_INTERVAL_SECONDS` | `1` | Idle wait before polling the ready queue again |
-
-## Project layout
-
-_To be completed._
-
-## Architecture
-
-PostgreSQL is the durable source of truth for job state. Redis holds a sorted set
-(`job_queue:ready`) of job IDs that are ready to run, and is only an index:
-appearing in it grants no ownership.
-
-A worker owns a job only after a single conditional `UPDATE` moves it from
-`pending` to `processing` in PostgreSQL. The pickup sequence is deliberately
-non-destructive:
-
-1. Read the best candidate with `ZRANGE` (no removal).
-2. Attempt the atomic claim.
-3. On success, remove the Redis entry and execute the handler.
-4. On failure, discard the stale entry and move on without executing.
-
-Popping from Redis before claiming would lose the job if the worker died in
-between, since nothing would durably own it and no entry would remain.
-
-Ready-queue ordering keeps priority and FIFO in separate places. The score is
-`MAX_PRIORITY - priority` and nothing else, so priority ordering is absolute for
-the lifetime of the system. FIFO within a priority comes from the member, which
-Redis compares lexicographically when scores tie:
-
-```text
-0000000000000000123:<job-uuid>
-```
-
-The zero-padded 19-digit Redis `INCR` sequence makes lexicographic order match
-numeric order. Mixing the sequence into the score instead would break the
-priority invariant once the sequence grew past the priority band width.
-
-That member is the entry token. Workers remove the exact token they observed,
-and a small `job_queue:entries` hash maps each job to its current token so a
-re-enqueue replaces the previous entry. Removal is compare-and-delete: the old
-member is dropped by exact value and the mapping is cleared only if it still
-points at that token, so a late cleanup cannot invalidate a newer entry.
-
-Run several workers with:
+## Tests
 
 ```bash
-docker compose up -d --scale worker=3
+docker compose run --rm api pytest -v
 ```
 
-Correctness does not depend on the number of workers.
+Tests use real PostgreSQL and Redis (a dedicated `jobqueue_test` database and
+Redis index 15). SQLite is not used: JSONB, the native status enum, partial
+unique indexes, `FOR UPDATE SKIP LOCKED`, and Redis Lua semantics are what the
+suite is proving. Tables are truncated between tests.
 
-## Execution safety
+## Submit a job
 
-Execution is **at-least-once**, not exactly-once. A job whose worker stalls or
-dies is retried, and the first attempt may already have had an effect on the
-outside world that nothing can recall. What the service does guarantee is that
-only one attempt can ever *write job state*, which is what keeps the database
-consistent while allowing recovery.
-
-### Ownership, leases and fencing
-
-Each worker process has a `worker_id`. Each successful claim also mints a random
-`execution_token` and takes a lease:
-
-```text
-status = processing, worker_id, execution_token = <new uuid>,
-lease_expires_at = now() + JOB_LEASE_SECONDS, started_at = now(),
-attempt_count = attempt_count + 1
+```bash
+curl -s http://localhost:8000/jobs \
+  -H 'content-type: application/json' \
+  -d '{"type":"email","payload":{"to":"user@example.com","subject":"Hello"}}'
 ```
 
-`worker_id` says which process owns the job; `execution_token` says which
-*ownership generation*. Every later write by that worker is conditional on all
-four of job id, `status = processing`, `worker_id` and `execution_token`:
+Job types: `email`, `webhook`, `report`, `batch`. Each payload is validated
+before persist. `priority` is 0–100 (higher runs sooner). `max_attempts` is
+fixed at 3 by the server.
+
+Idempotent submit — reuse of a live key returns the original job with `200`:
+
+```bash
+curl -s http://localhost:8000/jobs \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: demo-1' \
+  -d '{"type":"email","payload":{"to":"user@example.com","subject":"Hello"}}'
+```
+
+## Inspect, list, cancel, retry
+
+```bash
+# one job
+curl -s http://localhost:8000/jobs/<job-id>
+
+# newest first; optional filters
+curl -s 'http://localhost:8000/jobs?status=pending&limit=20'
+curl -s 'http://localhost:8000/jobs?type=email&offset=0&limit=50'
+
+# cancel pending or scheduled (already-cancelled is idempotent 200)
+curl -s -X POST http://localhost:8000/jobs/<job-id>/cancel
+
+# new three-attempt cycle for a failed job (attempt_count returns to 0)
+curl -s -X POST http://localhost:8000/jobs/<job-id>/retry
+```
+
+`processing`, `completed`, and `failed` cannot be cancelled (`409`). Only
+`failed` can be retried (`409` otherwise). Unknown id: `404`.
+
+## Scheduled jobs
+
+A future timezone-aware `scheduled_at` creates the job as `scheduled`. It is
+not enqueued until the scheduler sees `scheduled_at <= now()` and atomically
+moves it to `pending`.
+
+```bash
+curl -s http://localhost:8000/jobs \
+  -H 'content-type: application/json' \
+  -d '{"type":"email","payload":{"to":"user@example.com","subject":"Later"},"scheduled_at":"2030-01-01T00:00:00Z"}'
+```
+
+The same `scheduled` state is used for delayed retries.
+
+## Priority and idempotency
+
+Higher `priority` is always served first, regardless of how many jobs have
+already been enqueued. Equal priority is FIFO by **enqueue order**, not by
+`created_at`. Two commits could in principle be published to Redis in the
+opposite order.
+
+`Idempotency-Key` is stored for 24 hours. The partial unique index is the
+concurrency guarantee; the application releases an expired key with a
+conditional `UPDATE` that re-checks expiry. A replay never enqueues again.
+
+## Retry timing
+
+| After | Next step |
+| --- | --- |
+| attempt 1 fails | retry in 30 seconds |
+| attempt 2 fails | retry in 120 seconds |
+| attempt 3 fails | `failed` permanently |
+
+Attempt 1 is immediate (the first claim). Nothing sleeps for the backoff: the
+delay is `scheduled_at`. Manual retry of a `failed` job starts a **new** cycle
+with `attempt_count = 0`.
+
+## Crash recovery and fencing
+
+Each claim mints a new `execution_token` and a lease
+(`lease_expires_at = now() + JOB_LEASE_SECONDS`). While the handler runs, a
+heartbeat extends that lease. If the owner dies, `lease_expires_at < now()`
+lets recovery treat the attempt as failed: retry with the same backoff, or
+`failed` with `worker lease expired` when attempts are exhausted.
+
+Every owner write (heartbeat, progress, complete, fail) is:
 
 ```sql
 WHERE id = :job_id AND status = 'processing'
   AND worker_id = :worker_id AND execution_token = :execution_token
 ```
 
-Zero updated rows means the attempt was taken away, and the worker raises
-`OwnershipLostError` instead of assuming the write landed. This applies to the
-heartbeat, progress updates, completion and failure alike, so the classic race
-is closed: worker A stalls, its lease expires, recovery releases the job, worker
-B claims it with a new token, and A's late completion updates nothing.
+Zero rows means the attempt was taken away. A stale worker cannot complete or
+update a job that recovery has already handed to someone else.
 
-`started_at` is restamped on every claim, so it describes the attempt currently
-running rather than an attempt that already failed. Lease logic never reads it.
-
-### Heartbeat
-
-While a handler runs, a background heartbeat pushes `lease_expires_at` forward
-every `JOB_HEARTBEAT_SECONDS`, using the same fenced update. The heartbeat
-interval must be smaller than the lease, and configuration refuses to start
-otherwise. If a beat finds the attempt gone it logs
-`job_heartbeat_ownership_lost` and the worker cancels the handler coroutine;
-external side effects already in flight cannot be cancelled.
-
-### Retry policy
-
-Three attempts, with fixed backoff (`app/services/retry_policy.py`):
-
-| Failure after | Next attempt waits |
-| --- | --- |
-| attempt 1 | 30 seconds |
-| attempt 2 | 120 seconds |
-| attempt 3 | never; the job is `failed` |
-
-A failure with attempts remaining moves `processing -> scheduled` with
-`scheduled_at = now() + backoff` and clears the ownership fields. The final
-failure moves `processing -> failed` and sets `completed_at`. Nothing sleeps for
-the backoff: the delay lives in `scheduled_at`.
-
-### Scheduler and recovery loops
-
-Every worker process runs three loops concurrently, and all of them are safe to
-run in every replica:
-
-| Loop | Responsibility |
-| --- | --- |
-| `worker/runner.py` | claim and execute ready jobs |
-| `worker/scheduler.py` | promote due `scheduled` jobs (future jobs and retries) to `pending`, then enqueue |
-| `worker/recovery.py` | release `processing` jobs whose lease expired |
-
-Both background loops select their rows with `FOR UPDATE SKIP LOCKED` and then
-re-prove their conditions in the `UPDATE`, so parallel loops take disjoint work
-and a row can only be activated or recovered once. Recovery additionally proves
-the lease is *still* expired at write time, so a worker whose heartbeat arrives
-mid-sweep keeps its job.
-
-A recovered attempt counts as a failed attempt, because `attempt_count` was
-already consumed at claim time. It therefore follows the same policy: retry with
-backoff while attempts remain, otherwise `failed` with the error
-`worker lease expired`.
-
-### Remaining failure window: PostgreSQL committed, Redis not
-
-The scheduler commits `scheduled -> pending` before enqueueing to Redis, because
-PostgreSQL is authoritative. If the Redis enqueue then fails, the job stays
-durably `pending` but invisible to workers, and the failure is logged as
-`scheduled_job_enqueue_failed` (`job_enqueue_failed` for direct submissions).
-This window is real and is not hidden behind a two-store pseudo-transaction:
-rolling the row back after a Redis timeout of unknown outcome can produce a
-double enqueue just as easily as a lost one. Closing it needs a reconciliation
-sweep that compares `pending` rows against the queue's entry mapping and
-re-queues only what is genuinely missing; that belongs with the queue-statistics
-work of a later phase, and blind re-enqueueing would destroy FIFO order.
-
-## API
-
-Full request and response schemas are browsable in Swagger UI at
-<http://localhost:8000/docs>.
-
-| Method | Path | Description |
-| --- | --- | --- |
-| `POST` | `/jobs` | Submit a job. `201` when created, `200` when an idempotency key replays an existing job. |
-| `GET` | `/jobs/{job_id}` | Fetch one job. `404` if unknown. |
-| `GET` | `/jobs` | List jobs, newest first. Filters: `status`, `type`. Pagination: `limit` (max 100, default 50), `offset`. |
-| `POST` | `/jobs/{job_id}/cancel` | Cancel a `pending` or `scheduled` job. Idempotent for an already-cancelled job (`200`). `409` if processing, completed or failed. `404` if unknown. |
-| `POST` | `/jobs/{job_id}/retry` | Re-queue a `failed` job as a new three-attempt cycle (`attempt_count = 0`). `409` otherwise. `404` if unknown. |
-| `GET` | `/health` | PostgreSQL and Redis probes plus queue/job-status counts. `503` if either store is unreachable. |
-
-Job types are `email`, `webhook`, `report` and `batch`, each with a payload
-validated against its own schema before the job is persisted. `priority` accepts
-0-100 where higher runs sooner. A future timezone-aware `scheduled_at` creates
-the job as `scheduled`; otherwise it is `pending`. `max_attempts` is fixed at 3
-by the server.
-
-Submitting with an `Idempotency-Key` header stores the key for 24 hours. Reusing
-a live key returns the original job with `200` instead of creating a duplicate;
-once the key expires it can be reused for a new job.
-
-A new `pending` job is committed to PostgreSQL and then published to the ready
-queue. A `scheduled` job is only persisted, and an idempotency replay never
-enqueues again. If the Redis publish fails after the commit, the job stays
-durably `pending` but invisible to workers until something re-queues it; the
-failure is logged as `job_enqueue_failed`. `/health` reports `pending` and
-`ready` separately so that window is visible.
-
-## Job execution
-
-Handlers are mocks that simulate work with async sleeps: `email` returns a
-message ID, `webhook` succeeds 80% of the time and otherwise fails, `report`
-returns a file URL, and `batch` processes each item while reporting progress.
-
-A successful job goes `pending` -> `processing` -> `completed`, storing its
-result, `progress = 100` and `completed_at`. A failure with attempts remaining
-goes `processing` -> `scheduled` and waits out its backoff before the scheduler
-returns it to `pending`; the final failure goes `processing` -> `failed`.
-Ownership fields (`worker_id`, `execution_token`, `lease_expires_at`) are cleared
-whenever a job leaves `processing`, so they only ever describe a live attempt.
-
-### Cancellation
-
-`POST /jobs/{id}/cancel` is a single conditional `UPDATE` that accepts only
-`pending` or `scheduled`. The database transition is the race against a worker
-claim: if cancel wins, the claim matches zero rows; if the claim wins, cancel
-returns `409`. `processing` jobs are never cancelled, because an in-flight
-attempt must finish under its owner (or be recovered when its lease expires).
-
-Cancelling a job that is already `cancelled` returns the existing row with
-`200`. That is the one idempotent case; `completed` and `failed` are conflicts.
-
-A cancelled `pending` job has its *current* Redis entry removed by token. If
-that cleanup fails, the job stays durably `cancelled` and the leftover entry
-cannot be claimed. Correctness does not depend on Redis.
-
-### Manual retry
-
-`POST /jobs/{id}/retry` accepts only `failed` jobs. It transitions
-`failed -> pending`, resets `attempt_count` to 0 (a new three-attempt cycle,
-so the `attempt_count <= max_attempts` constraint stays valid), and clears
-`error`, `result`, `progress`, `completed_at`, `started_at`, `scheduled_at` and
-the ownership fields. `max_attempts` stays 3. Previous attempts remain in
-structured logs.
-
-PostgreSQL is committed first. A Redis enqueue failure is logged as
-`job_retry_enqueue_failed` and leaves the job durably `pending`, the same
-window as submit and scheduler publish.
-
-### Graceful shutdown
-
-`SIGTERM`/`SIGINT` stop the worker accepting new work: no further claims, and
-no new scheduler or recovery sweep. An attempt this process already owns is
-drained to completion with its heartbeat still running, then the process
-exits. Compose gives the worker a `stop_grace_period` of two minutes so
-`docker stop` can wait for that drain. There is no application-level hard
-timeout; a `SIGKILL` (or a grace period that expires) is the crash path and
-lease recovery retries the abandoned attempt.
-
-Ownership-loss cancellation of the handler is unchanged and separate: that is
-what happens when recovery takes the job away, not when the process is asked
-to shut down.
-
-### Health
-
-`GET /health` probes PostgreSQL (`SELECT 1` plus a `GROUP BY status` count) and
-Redis (`ReadyQueue.size()`). Both counts are reported honestly. `ready`
-(Redis) and `pending` (PostgreSQL) may differ; that mismatch is the documented
-enqueue window and does not mark the service unhealthy. `completed` is included
-so the response shows throughput, not only backlog. Either store unreachable
-yields `503` with the failing component set to `unhealthy`.
-
-## Crash-recovery demonstration
-
-The lease and heartbeat values are configurable, so the demo can run with a short
-lease without changing the defaults:
+Short-lease demo (defaults stay 60s / 20s in code):
 
 ```bash
 JOB_LEASE_SECONDS=10 JOB_HEARTBEAT_SECONDS=3 RECOVERY_INTERVAL_SECONDS=2 \
   docker compose up -d --build
-
-# Submit a slow job and watch it get claimed.
-curl -s localhost:8000/jobs -H 'content-type: application/json' \
-  -d '{"type":"report","payload":{"report_type":"sales","format":"pdf"}}'
-curl -s localhost:8000/jobs/<id>   # processing, with worker_id and lease_expires_at
-
-# Kill the owning worker outright, so no SIGTERM handler runs.
-docker kill --signal=SIGKILL <worker-container>
-
-# After the lease expires, another worker's recovery loop releases the job
-# (job_recovered), the scheduler re-activates it after the backoff, and it runs
-# again with attempt_count = 2 and a different execution_token.
 ```
 
-Because recovery clears `execution_token`, the killed worker could not have
-written the job even if it came back: its token no longer matches any row.
+## Graceful shutdown and multiple workers
 
-## Testing
+`SIGTERM`/`SIGINT` stop new claims and new scheduler/recovery sweeps. An
+attempt this process already owns is drained with its heartbeat still running,
+then the process exits. Compose `stop_grace_period` is two minutes. `SIGKILL`,
+or a grace period that expires, is the crash path.
 
 ```bash
-docker compose run --rm api pytest -v
+docker compose up -d --scale worker=3
 ```
 
-Tests run against a real PostgreSQL instance, in a separate `jobqueue_test`
-database that is created and migrated automatically. SQLite is deliberately not
-used, because the behaviour under test (JSONB, the native status enum, and the
-partial unique index behind idempotency) is PostgreSQL-specific. Tables are
-truncated between tests, so the suite is repeatable.
+Correctness does not depend on the number of workers. Atomic database
+transitions are the only coordination.
+
+## Batch progress
+
+A `batch` job reports progress while it runs (`0–100`). Updates are fenced by
+`worker_id` and `execution_token`, so a recovered attempt cannot overwrite a
+newer owner's progress.
+
+```bash
+curl -s http://localhost:8000/jobs \
+  -H 'content-type: application/json' \
+  -d '{"type":"batch","payload":{"items":[{"i":1},{"i":2},{"i":3}]}}'
+```
+
+## Health
+
+```bash
+curl -s http://localhost:8000/health
+```
+
+```json
+{
+  "status": "healthy",
+  "database": "healthy",
+  "redis": "healthy",
+  "queue": {
+    "ready": 5,
+    "pending": 5,
+    "scheduled": 2,
+    "processing": 1,
+    "completed": 20,
+    "failed": 3,
+    "cancelled": 1
+  }
+}
+```
+
+`ready` is Redis; the rest are PostgreSQL `GROUP BY` counts. They can differ.
+That mismatch is the enqueue window below, not an outage, and does not mark
+the service unhealthy. Either store unreachable returns `503`.
+
+## Configuration
+
+Copy `.env.example` to `.env` only to override defaults.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `JOB_LEASE_SECONDS` | `60` | Claim ownership before recovery may take it |
+| `JOB_HEARTBEAT_SECONDS` | `20` | Must be smaller than the lease |
+| `SCHEDULER_INTERVAL_SECONDS` | `1` | Due-schedule poll |
+| `RECOVERY_INTERVAL_SECONDS` | `5` | Expired-lease poll |
+| `WORKER_POLL_INTERVAL_SECONDS` | `1` | Idle ready-queue poll |
+
+## Known limitations
+
+- Redis is not authoritative. A job is runnable only if PostgreSQL says so.
+- If PostgreSQL commits `pending` and Redis enqueue then fails, the job is
+  durable but invisible to workers until something re-queues it. `/health`
+  shows `pending` vs `ready`. This is not closed with a two-store transaction.
+- Handlers are mocks (sleep + a result). External side effects are
+  at-least-once; they are not recalled on retry or recovery.
+- `processing` jobs cannot be cancelled.
+- There is no dead-letter queue, hard execution timeout, or authentication.
+
+## Requirements coverage
+
+| Requirement | Where | Tests |
+| --- | --- | --- |
+| Python 3.11+ | `Dockerfile` (`python:3.12-slim`) | image build |
+| Web framework | FastAPI in `app/main.py`, `app/api/jobs.py` | `tests/test_jobs_api.py` |
+| Relational persistence | PostgreSQL + SQLAlchemy + Alembic | suite (real Postgres) |
+| Queue/cache | Redis ZSET in `app/services/queue_service.py` | `tests/test_ready_queue.py` |
+| Separate worker | `worker/main.py`, Compose `worker` service | `tests/test_worker.py` |
+| 3 attempts, 30s / 120s backoff | `app/services/retry_policy.py` | `tests/test_retry.py` |
+| Priority processing | score `100 - priority` | `tests/test_ready_queue.py`, `tests/test_worker.py` |
+| Cancellation | `POST /jobs/{id}/cancel` | `tests/test_cancel.py` |
+| Docker Compose | `docker-compose.yml` | documented cold start |
+| Submit / retrieve | `POST/GET /jobs` | `tests/test_jobs_api.py` |
+| Completion | claim → handler → `completed` | `tests/test_worker.py`, `tests/test_claim.py` |
+| Failure / retry | `processing → scheduled` then fail | `tests/test_retry.py`, `tests/test_worker.py` |
+| Idempotency | `Idempotency-Key`, partial unique index | `tests/test_idempotency.py` |
+| Scheduled jobs | `scheduled_at`, scheduler loop | `tests/test_scheduler.py` |
+| Crash recovery | lease + `worker/recovery.py` | `tests/test_recovery.py`, `tests/test_fencing.py` |
+| JSON logs with job context | `app/core/logging.py` | worker events (`job_id`, token, attempt) |
+| Graceful drain | SIGTERM finishes the owned attempt | `tests/test_shutdown.py` |
+| Health + queue stats | `GET /health` | `tests/test_health.py` |
+| Multiple workers | `--scale worker=N` | `tests/test_worker.py`, `tests/test_claim.py` |
+| Batch progress | fenced `progress` updates | `tests/test_worker.py`, `tests/test_handlers.py` |
+
+Not implemented (and not claimed): dead-letter queue, hard job timeout,
+authentication, frontend.
+
+Design rationale is in `DECISIONS.md`. How AI was used is in `AI_USAGE.md`.

@@ -17,10 +17,9 @@ loudly rather than papered over. It is not closed with a distributed
 pseudo-transaction: rolling the row back to SCHEDULED after a Redis timeout
 whose outcome is unknown can just as easily produce a double enqueue, and
 neither store can promise the other's write happened. A reconciliation sweep
-that re-queues PENDING jobs missing from the queue index is the honest fix, and
-it belongs with the queue-statistics work of a later phase, where it can be
-built to check the entry mapping instead of blindly re-enqueueing and destroying
-FIFO order.
+that re-queues PENDING jobs missing from the entry mapping is the honest fix;
+it is not implemented. Blind re-enqueueing would destroy FIFO order. `/health`
+reports the pending-versus-ready gap.
 """
 
 import asyncio

@@ -83,7 +83,7 @@ async def test_claiming_an_unknown_job_returns_none(session: AsyncSession) -> No
 
 
 async def test_claim_refuses_to_exceed_max_attempts(session: AsyncSession) -> None:
-    """Guards the attempt_count <= max_attempts constraint from Phase 1."""
+    """Guards the attempt_count <= max_attempts check constraint."""
     job = await _insert_job(session, attempt_count=3, max_attempts=3)
 
     assert await job_service.claim_job(session, job.id, WORKER) is None
@@ -131,7 +131,7 @@ async def test_complete_job_stores_result_and_completion_time(session: AsyncSess
 async def test_a_failed_attempt_with_attempts_left_is_rescheduled(
     session: AsyncSession,
 ) -> None:
-    """Phase 3's direct PROCESSING -> FAILED is now a delayed retry."""
+    """A failed attempt with retries left becomes SCHEDULED, not FAILED."""
     job = await _insert_job(session)
     claimed = await job_service.claim_job(session, job.id, WORKER)
     assert claimed is not None

@@ -156,9 +156,9 @@ async def submit_job(
     that is already queued or already finished.
 
     If the enqueue fails after the commit, the job stays durably PENDING but
-    invisible to workers until a reconciliation sweep (a later phase) re-queues
-    it. That window is logged loudly rather than hidden, and the response still
-    reports the truth: the job was persisted.
+    invisible to workers until something re-queues it. That window is logged
+    loudly rather than hidden, and the response still reports the truth: the
+    job was persisted. `/health` reports pending and ready separately.
     """
     job, created = await create_job(session, request, idempotency_key)
 

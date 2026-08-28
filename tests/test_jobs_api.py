@@ -198,7 +198,7 @@ async def test_list_rejects_unknown_filter_values(client: AsyncClient) -> None:
 async def test_created_job_is_not_claimed_by_any_worker(
     client: AsyncClient, session: AsyncSession
 ) -> None:
-    """Phase 2 only persists jobs; nothing claims or executes them yet."""
+    """Submitting a job does not claim it; a worker has to do that."""
     await client.post("/jobs", json=job_request())
 
     job = (await session.execute(select(Job))).scalars().one()
