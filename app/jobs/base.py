@@ -35,6 +35,10 @@ class JobContext:
     payload: dict[str, Any]
     attempt: int
     worker_id: str
+    #: The attempt this handler belongs to. Visible so handler logs can be tied
+    #: to one ownership generation; the fencing itself is the worker's job, and
+    #: report_progress is already scoped to this attempt.
+    execution_token: uuid.UUID | None = None
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     random: Callable[[], float] = random.random
     report_progress: Callable[[int, int], Awaitable[None]] = field(default=_no_progress)

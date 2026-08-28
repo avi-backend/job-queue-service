@@ -16,9 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.time import utcnow
 from app.db.models import Job, JobStatus
+from app.services import job_service
 from app.services.queue_service import ENTRIES_KEY, ReadyQueue
-from tests.factories import job_request
+from tests.factories import expire_lease, job_request, make_due
+from worker.recovery import LeaseRecovery
 from worker.runner import JobRunner
+from worker.scheduler import JobScheduler
 
 # 0.0 always succeeds, 0.99 always trips the simulated webhook failure.
 ALWAYS_SUCCEED = 0.0
@@ -55,7 +58,9 @@ async def test_worker_completes_an_email_job(
     assert job.started_at is not None
     assert job.attempt_count == 1
     assert job.error is None
-    assert job.worker_id == "worker-1"
+    assert job.worker_id is None
+    assert job.execution_token is None
+    assert job.lease_expires_at is None
     # The index entry is dropped only after durable ownership.
     assert await ready_queue.size() == 0
 
@@ -85,24 +90,60 @@ async def test_worker_completes_a_webhook_job(
     assert job.result == {"status_code": 200, "delivered": True}
 
 
-async def test_worker_marks_a_failed_webhook_as_failed(
+async def test_worker_reschedules_a_failed_webhook_for_retry(
     client: AsyncClient,
     session: AsyncSession,
     ready_queue: ReadyQueue,
     make_runner: Callable[..., JobRunner],
 ) -> None:
+    """A first failure is a retry, not the end of the job."""
     job_id = await _submit(client, "webhook")
 
     await make_runner(random_value=ALWAYS_FAIL).run_once()
 
     job = await _load(session, job_id)
-    assert job.status is JobStatus.FAILED
+    assert job.status is JobStatus.SCHEDULED
     assert job.error is not None and "503" in job.error
-    assert job.completed_at is not None
-    # Phase 3 does not retry, so the attempt is consumed and nothing re-queues.
+    assert job.scheduled_at is not None
+    assert job.completed_at is None
     assert job.attempt_count == 1
     assert job.result is None
+    # A waiting retry is neither owned nor queued: the scheduler publishes it
+    # when the backoff has elapsed.
+    assert job.worker_id is None
+    assert job.execution_token is None
+    assert job.lease_expires_at is None
     assert await ready_queue.size() == 0
+
+
+async def test_worker_fails_a_job_permanently_on_its_final_attempt(
+    client: AsyncClient,
+    session: AsyncSession,
+    ready_queue: ReadyQueue,
+    make_runner: Callable[..., JobRunner],
+    make_scheduler: Callable[..., JobScheduler],
+) -> None:
+    """Three attempts, two backoffs, then FAILED for good."""
+    job_id = await _submit(client, "webhook")
+    runner = make_runner(random_value=ALWAYS_FAIL)
+
+    for expected_attempt in (1, 2, 3):
+        assert await runner.run_once() is True
+        job = await _load(session, job_id)
+        assert job.attempt_count == expected_attempt
+        if expected_attempt < 3:
+            assert job.status is JobStatus.SCHEDULED
+            await make_due(session, uuid.UUID(job_id))
+            assert await make_scheduler().run_once() == 1
+
+    job = await _load(session, job_id)
+    assert job.status is JobStatus.FAILED
+    assert job.completed_at is not None
+    assert job.attempt_count == 3
+    assert await ready_queue.size() == 0
+    # Nothing brings it back: no fourth attempt is ever scheduled.
+    assert await make_scheduler().run_once() == 0
+    assert await runner.run_once() is False
 
 
 async def test_batch_job_reaches_full_progress(
@@ -131,13 +172,15 @@ async def test_batch_progress_is_persisted_while_processing(
     runner = make_runner()
     original = runner._progress_reporter
 
-    def tracking_reporter(progress_session, job):
-        report = original(progress_session, job)
+    def tracking_reporter(progress_session, attempt):
+        report = original(progress_session, attempt)
 
         async def wrapped(processed: int, total: int) -> None:
             await report(processed, total)
             observed.append(
-                await progress_session.scalar(select(Job.progress).where(Job.id == job.id))
+                await progress_session.scalar(
+                    select(Job.progress).where(Job.id == attempt.job_id)
+                )
             )
 
         return wrapped
@@ -292,8 +335,9 @@ async def test_two_workers_cannot_execute_the_same_job(
     assert results.count(True) == 1
     job = await _load(session, job_id)
     assert job.status is JobStatus.COMPLETED
+    # One claim means one attempt and one execution token, now released.
     assert job.attempt_count == 1
-    assert job.worker_id in {"worker-a", "worker-b"}
+    assert job.execution_token is None
 
 
 async def test_three_workers_drain_a_burst_exactly_once(
@@ -316,7 +360,70 @@ async def test_three_workers_drain_a_burst_exactly_once(
     assert len(jobs) == len(job_ids)
     assert all(job.status is JobStatus.COMPLETED for job in jobs)
     assert all(job.attempt_count == 1 for job in jobs)
-    assert all(job.worker_id is not None for job in jobs)
+    assert all(job.execution_token is None for job in jobs)
+    assert await ready_queue.size() == 0
+
+
+async def test_three_full_workers_handle_mixed_work_safely(
+    client: AsyncClient,
+    session: AsyncSession,
+    session_factory,
+    ready_queue: ReadyQueue,
+    make_runner: Callable[..., JobRunner],
+    make_scheduler: Callable[..., JobScheduler],
+    make_recovery: Callable[..., LeaseRecovery],
+) -> None:
+    """`--scale worker=3` with all three loops running in every replica.
+
+    Ready jobs, a due scheduled job and an abandoned PROCESSING job are handled
+    at the same time by three of each loop. Every job must be touched exactly
+    once: no duplicate execution, no duplicate activation, no double recovery.
+    """
+    ready = [await _submit(client, priority=index) for index in range(4)]
+    due = await _submit(client, scheduled_at=(utcnow() + timedelta(hours=1)).isoformat())
+    await make_due(session, uuid.UUID(due))
+
+    abandoned = await _submit(client)
+    async with session_factory() as claim_session:
+        claimed = await job_service.claim_job(
+            claim_session, uuid.UUID(abandoned), "worker-crashed"
+        )
+        assert claimed is not None
+        await expire_lease(claim_session, uuid.UUID(abandoned))
+
+    stop = asyncio.Event()
+    loops = []
+    for index in range(3):
+        loops.append(make_runner(worker_id=f"worker-{index}").run_forever(stop))
+        loops.append(make_scheduler(worker_id=f"worker-{index}").run_forever(stop))
+        loops.append(make_recovery(worker_id=f"worker-{index}").run_forever(stop))
+    running = asyncio.gather(*loops)
+
+    try:
+        for _ in range(500):
+            finished = [
+                (await _load(session, job_id)).status is JobStatus.COMPLETED
+                for job_id in [*ready, due]
+            ]
+            recovered = (await _load(session, abandoned)).status is JobStatus.SCHEDULED
+            if all(finished) and recovered:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        stop.set()
+        await asyncio.wait_for(running, timeout=10)
+
+    for job_id in [*ready, due]:
+        job = await _load(session, job_id)
+        assert job.status is JobStatus.COMPLETED
+        assert job.attempt_count == 1
+
+    crashed = await _load(session, abandoned)
+    assert crashed.status is JobStatus.SCHEDULED
+    assert crashed.error == job_service.LEASE_EXPIRED_ERROR
+    # Recovered once: a second recovery would have consumed another attempt.
+    assert crashed.attempt_count == 1
+    assert crashed.execution_token is None
     assert await ready_queue.size() == 0
 
 

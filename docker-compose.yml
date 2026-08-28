@@ -6,6 +6,16 @@ x-app-env: &app-env
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
   LOG_FORMAT: ${LOG_FORMAT:-json}
   ENVIRONMENT: ${ENVIRONMENT:-local}
+  # Distributed-safety timings. Defaults are the production values; overriding
+  # them (a short lease, for example) is how the crash-recovery demo is run
+  # without editing code.
+  WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-1}
+  JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-60}
+  JOB_HEARTBEAT_SECONDS: ${JOB_HEARTBEAT_SECONDS:-20}
+  SCHEDULER_INTERVAL_SECONDS: ${SCHEDULER_INTERVAL_SECONDS:-1}
+  SCHEDULER_BATCH_SIZE: ${SCHEDULER_BATCH_SIZE:-100}
+  RECOVERY_INTERVAL_SECONDS: ${RECOVERY_INTERVAL_SECONDS:-5}
+  RECOVERY_BATCH_SIZE: ${RECOVERY_BATCH_SIZE:-100}
 
 services:
   postgres:

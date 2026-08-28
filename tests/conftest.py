@@ -30,7 +30,9 @@ from app.core.redis import get_redis
 from app.db.session import get_session
 from app.main import app
 from app.services.queue_service import ReadyQueue
+from worker.recovery import LeaseRecovery
 from worker.runner import JobRunner
+from worker.scheduler import JobScheduler
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAINTENANCE_DATABASE = "postgres"
@@ -138,20 +140,65 @@ async def instant_sleep(seconds: float) -> None:
     """Stand-in for asyncio.sleep so simulated work costs no wall-clock time."""
 
 
+#: Test leases are long enough that nothing expires mid-test, and the heartbeat
+#: interval is short enough that a beat is observable without waiting on real
+#: production timings. No test ever waits out a 60s lease or a 20s heartbeat.
+TEST_LEASE_SECONDS = 30.0
+TEST_HEARTBEAT_SECONDS = 0.05
+
+
 @pytest.fixture
 def make_runner(
     session_factory: async_sessionmaker[AsyncSession], ready_queue: ReadyQueue
 ) -> Callable[..., JobRunner]:
     """Build workers whose sleeps are instant and whose randomness is fixed."""
 
-    def build(worker_id: str = "worker-1", random_value: float = 0.0) -> JobRunner:
+    def build(
+        worker_id: str = "worker-1",
+        random_value: float = 0.0,
+        lease_seconds: float = TEST_LEASE_SECONDS,
+        heartbeat_interval: float = TEST_HEARTBEAT_SECONDS,
+    ) -> JobRunner:
         return JobRunner(
             session_factory=session_factory,
             ready_queue=ready_queue,
             worker_id=worker_id,
             poll_interval=0.01,
+            lease_seconds=lease_seconds,
+            heartbeat_interval=heartbeat_interval,
             sleep=instant_sleep,
             random_source=lambda: random_value,
+        )
+
+    return build
+
+
+@pytest.fixture
+def make_scheduler(
+    session_factory: async_sessionmaker[AsyncSession], ready_queue: ReadyQueue
+) -> Callable[..., JobScheduler]:
+    def build(worker_id: str = "scheduler-1", batch_size: int = 100) -> JobScheduler:
+        return JobScheduler(
+            session_factory=session_factory,
+            ready_queue=ready_queue,
+            worker_id=worker_id,
+            interval=0.01,
+            batch_size=batch_size,
+        )
+
+    return build
+
+
+@pytest.fixture
+def make_recovery(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> Callable[..., LeaseRecovery]:
+    def build(worker_id: str = "recovery-1", batch_size: int = 100) -> LeaseRecovery:
+        return LeaseRecovery(
+            session_factory=session_factory,
+            worker_id=worker_id,
+            interval=0.01,
+            batch_size=batch_size,
         )
 
     return build

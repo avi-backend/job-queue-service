@@ -2,14 +2,17 @@
 
 import asyncio
 import uuid
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.errors import OwnershipLostError
 from app.core.time import utcnow
 from app.db.models import Job, JobStatus
 from app.services import job_service
+from app.services.attempt import Attempt
 
 WORKER = "worker-a"
 
@@ -109,59 +112,90 @@ async def test_concurrent_claims_yield_exactly_one_winner(
 
 async def test_complete_job_stores_result_and_completion_time(session: AsyncSession) -> None:
     job = await _insert_job(session)
-    await job_service.claim_job(session, job.id, WORKER)
+    claimed = await job_service.claim_job(session, job.id, WORKER)
+    assert claimed is not None
 
-    completed = await job_service.complete_job(session, job.id, {"status": "sent"})
+    completed = await job_service.complete_job(session, Attempt.of(claimed), {"status": "sent"})
 
-    assert completed is not None
     assert completed.status is JobStatus.COMPLETED
     assert completed.result == {"status": "sent"}
     assert completed.progress == 100
     assert completed.completed_at is not None
     assert completed.error is None
+    # A finished job is no longer owned or leased.
+    assert completed.worker_id is None
+    assert completed.execution_token is None
     assert completed.lease_expires_at is None
 
 
-async def test_fail_job_stores_error_and_completion_time(session: AsyncSession) -> None:
+async def test_a_failed_attempt_with_attempts_left_is_rescheduled(
+    session: AsyncSession,
+) -> None:
+    """Phase 3's direct PROCESSING -> FAILED is now a delayed retry."""
     job = await _insert_job(session)
-    await job_service.claim_job(session, job.id, WORKER)
+    claimed = await job_service.claim_job(session, job.id, WORKER)
+    assert claimed is not None
 
-    failed = await job_service.fail_job(session, job.id, "delivery failed")
+    result = await job_service.fail_attempt(
+        session, Attempt.of(claimed), "delivery failed"
+    )
 
-    assert failed is not None
-    assert failed.status is JobStatus.FAILED
-    assert failed.error == "delivery failed"
-    assert failed.completed_at is not None
-    assert failed.attempt_count == 1
+    assert result.outcome is job_service.AttemptOutcome.RETRY_SCHEDULED
+    assert result.job.status is JobStatus.SCHEDULED
+    assert result.job.error == "delivery failed"
+    assert result.job.attempt_count == 1
+    assert result.job.completed_at is None
 
 
-async def test_terminal_transitions_require_processing(session: AsyncSession) -> None:
-    """A pending job cannot be completed or failed without being claimed first."""
-    job = await _insert_job(session)
+async def test_a_failed_final_attempt_stores_error_and_completion_time(
+    session: AsyncSession,
+) -> None:
+    job = await _insert_job(session, attempt_count=2, max_attempts=3)
+    claimed = await job_service.claim_job(session, job.id, WORKER)
+    assert claimed is not None
 
-    assert await job_service.complete_job(session, job.id, {}) is None
-    assert await job_service.fail_job(session, job.id, "nope") is None
+    result = await job_service.fail_attempt(
+        session, Attempt.of(claimed), "delivery failed"
+    )
+
+    assert result.outcome is job_service.AttemptOutcome.PERMANENTLY_FAILED
+    assert result.job.status is JobStatus.FAILED
+    assert result.job.error == "delivery failed"
+    assert result.job.completed_at is not None
+    assert result.job.attempt_count == 3
 
 
 async def test_progress_updates_only_apply_while_processing(session: AsyncSession) -> None:
     job = await _insert_job(session)
+    unowned = Attempt(
+        job_id=job.id,
+        worker_id=WORKER,
+        execution_token=uuid.uuid4(),
+        attempt_count=0,
+        max_attempts=job.max_attempts,
+    )
 
-    await job_service.update_progress(session, job.id, 50)
+    with pytest.raises(OwnershipLostError):
+        await job_service.update_progress(session, unowned, 50)
     await session.refresh(job)
     assert job.progress == 0
 
-    await job_service.claim_job(session, job.id, WORKER)
-    await job_service.update_progress(session, job.id, 50)
+    claimed = await job_service.claim_job(session, job.id, WORKER)
+    assert claimed is not None
+    await job_service.update_progress(session, Attempt.of(claimed), 50)
     await session.refresh(job)
     assert job.progress == 50
 
 
-async def test_started_at_is_preserved_across_claims(session: AsyncSession) -> None:
-    """COALESCE keeps the original start time when a job is claimed again later."""
-    original = utcnow()
+async def test_started_at_marks_the_start_of_the_current_attempt(
+    session: AsyncSession,
+) -> None:
+    """The claim restamps started_at; lease logic never reads an older attempt."""
+    original = utcnow() - timedelta(hours=1)
     job = await _insert_job(session, started_at=original)
 
     claimed = await job_service.claim_job(session, job.id, WORKER)
 
     assert claimed is not None
-    assert claimed.started_at == original
+    assert claimed.started_at is not None
+    assert claimed.started_at > original

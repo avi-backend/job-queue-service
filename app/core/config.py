@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +31,34 @@ class Settings(BaseSettings):
 
     #: How long a worker waits before polling the ready queue again.
     worker_poll_interval_seconds: float = Field(default=1.0, gt=0)
+
+    #: How long a claim owns a job before crash recovery may take it away.
+    job_lease_seconds: float = Field(default=60.0, gt=0)
+    #: How often the owning worker extends its lease. Must stay below the lease.
+    job_heartbeat_seconds: float = Field(default=20.0, gt=0)
+
+    #: How often each worker looks for due SCHEDULED jobs, and how many it takes.
+    scheduler_interval_seconds: float = Field(default=1.0, gt=0)
+    scheduler_batch_size: int = Field(default=100, ge=1)
+
+    #: How often each worker looks for expired leases, and how many it recovers.
+    recovery_interval_seconds: float = Field(default=5.0, gt=0)
+    recovery_batch_size: int = Field(default=100, ge=1)
+
+    @model_validator(mode="after")
+    def _heartbeat_must_beat_before_the_lease_expires(self) -> "Settings":
+        """A heartbeat slower than the lease would let a healthy worker be recovered.
+
+        Enforced here rather than documented, because the failure it prevents
+        (two workers executing the same job) is the one this phase exists to
+        rule out. Some headroom is required so a single slow beat is survivable.
+        """
+        if self.job_heartbeat_seconds >= self.job_lease_seconds:
+            raise ValueError(
+                "JOB_HEARTBEAT_SECONDS must be smaller than JOB_LEASE_SECONDS "
+                f"(got {self.job_heartbeat_seconds} >= {self.job_lease_seconds})"
+            )
+        return self
 
     @property
     def sync_database_url(self) -> str:

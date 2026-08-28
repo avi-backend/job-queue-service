@@ -5,11 +5,12 @@ state; Redis is used only as the ready-job delivery queue.
 
 Author: Avi
 
-> Status: Phase 3. Job submission, the Redis ready queue, atomic claiming and
-> worker execution are implemented, and multiple workers can run concurrently.
-> Retries, retry backoff, scheduled-job activation, crash recovery, heartbeat
-> leases, job timeouts and cancellation are **not** implemented yet. A failed
-> job stops at `failed` and is not retried.
+> Status: Phase 4A. Job submission, the Redis ready queue, atomic claiming,
+> worker execution, execution-token fencing, processing leases with heartbeats,
+> retry with backoff, scheduled-job activation and worker crash recovery are
+> implemented, and multiple workers can run concurrently. Cancellation, a manual
+> retry endpoint, queue statistics on `/health`, a dead letter queue, hard
+> execution timeouts and authentication are **not** implemented yet.
 
 ## Requirements
 
@@ -25,7 +26,11 @@ The API is available on <http://localhost:8000>, with Swagger UI at
 <http://localhost:8000/docs>.
 
 A one-shot `migrate` service runs `alembic upgrade head` and must exit
-successfully before the API and worker start. To run migrations manually:
+successfully before the API and worker start. Revision `0002` adds the fencing
+token and also releases any Phase 3 `processing` row that has no token or lease:
+those rows cannot be recovered (`NULL < now()` is unknown), so the upgrade
+moves them to `scheduled` with `scheduled_at = now()` and preserves
+`attempt_count`. To run migrations manually:
 
 ```bash
 docker compose run --rm migrate
@@ -35,6 +40,18 @@ docker compose run --rm migrate
 
 Copy `.env.example` to `.env` to override defaults. Compose has working defaults
 for local development, so a `.env` file is optional.
+
+Distributed-safety timings:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `JOB_LEASE_SECONDS` | `60` | How long a claim owns a job before recovery may take it |
+| `JOB_HEARTBEAT_SECONDS` | `20` | Lease extension interval; must be smaller than the lease |
+| `SCHEDULER_INTERVAL_SECONDS` | `1` | How often each worker looks for due scheduled jobs |
+| `SCHEDULER_BATCH_SIZE` | `100` | Maximum jobs activated per scheduler pass |
+| `RECOVERY_INTERVAL_SECONDS` | `5` | How often each worker looks for expired leases |
+| `RECOVERY_BATCH_SIZE` | `100` | Maximum jobs recovered per pass |
+| `WORKER_POLL_INTERVAL_SECONDS` | `1` | Idle wait before polling the ready queue again |
 
 ## Project layout
 
@@ -85,6 +102,102 @@ docker compose up -d --scale worker=3
 
 Correctness does not depend on the number of workers.
 
+## Execution safety
+
+Execution is **at-least-once**, not exactly-once. A job whose worker stalls or
+dies is retried, and the first attempt may already have had an effect on the
+outside world that nothing can recall. What the service does guarantee is that
+only one attempt can ever *write job state*, which is what keeps the database
+consistent while allowing recovery.
+
+### Ownership, leases and fencing
+
+Each worker process has a `worker_id`. Each successful claim also mints a random
+`execution_token` and takes a lease:
+
+```text
+status = processing, worker_id, execution_token = <new uuid>,
+lease_expires_at = now() + JOB_LEASE_SECONDS, started_at = now(),
+attempt_count = attempt_count + 1
+```
+
+`worker_id` says which process owns the job; `execution_token` says which
+*ownership generation*. Every later write by that worker is conditional on all
+four of job id, `status = processing`, `worker_id` and `execution_token`:
+
+```sql
+WHERE id = :job_id AND status = 'processing'
+  AND worker_id = :worker_id AND execution_token = :execution_token
+```
+
+Zero updated rows means the attempt was taken away, and the worker raises
+`OwnershipLostError` instead of assuming the write landed. This applies to the
+heartbeat, progress updates, completion and failure alike, so the classic race
+is closed: worker A stalls, its lease expires, recovery releases the job, worker
+B claims it with a new token, and A's late completion updates nothing.
+
+`started_at` is restamped on every claim, so it describes the attempt currently
+running rather than an attempt that already failed. Lease logic never reads it.
+
+### Heartbeat
+
+While a handler runs, a background heartbeat pushes `lease_expires_at` forward
+every `JOB_HEARTBEAT_SECONDS`, using the same fenced update. The heartbeat
+interval must be smaller than the lease, and configuration refuses to start
+otherwise. If a beat finds the attempt gone it logs
+`job_heartbeat_ownership_lost` and the worker cancels the handler coroutine;
+external side effects already in flight cannot be cancelled.
+
+### Retry policy
+
+Three attempts, with fixed backoff (`app/services/retry_policy.py`):
+
+| Failure after | Next attempt waits |
+| --- | --- |
+| attempt 1 | 30 seconds |
+| attempt 2 | 120 seconds |
+| attempt 3 | never; the job is `failed` |
+
+A failure with attempts remaining moves `processing -> scheduled` with
+`scheduled_at = now() + backoff` and clears the ownership fields. The final
+failure moves `processing -> failed` and sets `completed_at`. Nothing sleeps for
+the backoff: the delay lives in `scheduled_at`.
+
+### Scheduler and recovery loops
+
+Every worker process runs three loops concurrently, and all of them are safe to
+run in every replica:
+
+| Loop | Responsibility |
+| --- | --- |
+| `worker/runner.py` | claim and execute ready jobs |
+| `worker/scheduler.py` | promote due `scheduled` jobs (future jobs and retries) to `pending`, then enqueue |
+| `worker/recovery.py` | release `processing` jobs whose lease expired |
+
+Both background loops select their rows with `FOR UPDATE SKIP LOCKED` and then
+re-prove their conditions in the `UPDATE`, so parallel loops take disjoint work
+and a row can only be activated or recovered once. Recovery additionally proves
+the lease is *still* expired at write time, so a worker whose heartbeat arrives
+mid-sweep keeps its job.
+
+A recovered attempt counts as a failed attempt, because `attempt_count` was
+already consumed at claim time. It therefore follows the same policy: retry with
+backoff while attempts remain, otherwise `failed` with the error
+`worker lease expired`.
+
+### Remaining failure window: PostgreSQL committed, Redis not
+
+The scheduler commits `scheduled -> pending` before enqueueing to Redis, because
+PostgreSQL is authoritative. If the Redis enqueue then fails, the job stays
+durably `pending` but invisible to workers, and the failure is logged as
+`scheduled_job_enqueue_failed` (`job_enqueue_failed` for direct submissions).
+This window is real and is not hidden behind a two-store pseudo-transaction:
+rolling the row back after a Redis timeout of unknown outcome can produce a
+double enqueue just as easily as a lost one. Closing it needs a reconciliation
+sweep that compares `pending` rows against the queue's entry mapping and
+re-queues only what is genuinely missing; that belongs with the queue-statistics
+work of a later phase, and blind re-enqueueing would destroy FIFO order.
+
 ## API
 
 Full request and response schemas are browsable in Swagger UI at
@@ -120,13 +233,41 @@ message ID, `webhook` succeeds 80% of the time and otherwise fails, `report`
 returns a file URL, and `batch` processes each item while reporting progress.
 
 A successful job goes `pending` -> `processing` -> `completed`, storing its
-result, `progress = 100` and `completed_at`. In this phase a failure goes
-`pending` -> `processing` -> `failed`, storing the error. There is no retry yet,
-so a failure is terminal even when attempts remain.
+result, `progress = 100` and `completed_at`. A failure with attempts remaining
+goes `processing` -> `scheduled` and waits out its backoff before the scheduler
+returns it to `pending`; the final failure goes `processing` -> `failed`.
+Ownership fields (`worker_id`, `execution_token`, `lease_expires_at`) are cleared
+whenever a job leaves `processing`, so they only ever describe a live attempt.
 
-Workers respond to `SIGTERM`/`SIGINT` by stopping their polling loop. Waiting for
-an in-flight job to finish before exiting is part of a later phase, together with
-heartbeat leases and crash recovery.
+Workers respond to `SIGTERM`/`SIGINT` by stopping all three loops. Waiting for an
+in-flight job to finish before exiting is part of Phase 4B; today a job
+interrupted by shutdown keeps its lease until it expires and is then recovered,
+which is exactly the crash path.
+
+## Crash-recovery demonstration
+
+The lease and heartbeat values are configurable, so the demo can run with a short
+lease without changing the defaults:
+
+```bash
+JOB_LEASE_SECONDS=10 JOB_HEARTBEAT_SECONDS=3 RECOVERY_INTERVAL_SECONDS=2 \
+  docker compose up -d --build
+
+# Submit a slow job and watch it get claimed.
+curl -s localhost:8000/jobs -H 'content-type: application/json' \
+  -d '{"type":"report","payload":{"report_type":"sales","format":"pdf"}}'
+curl -s localhost:8000/jobs/<id>   # processing, with worker_id and lease_expires_at
+
+# Kill the owning worker outright, so no SIGTERM handler runs.
+docker kill --signal=SIGKILL <worker-container>
+
+# After the lease expires, another worker's recovery loop releases the job
+# (job_recovered), the scheduler re-activates it after the backoff, and it runs
+# again with attempt_count = 2 and a different execution_token.
+```
+
+Because recovery clears `execution_token`, the killed worker could not have
+written the job even if it came back: its token no longer matches any row.
 
 ## Testing
 

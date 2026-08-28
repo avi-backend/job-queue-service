@@ -79,9 +79,15 @@ class Job(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    # Ownership of an in-flight job. Set only by the atomic PENDING -> PROCESSING
-    # transition that a worker performs in a later phase.
+    # Ownership of an in-flight job, set only by the atomic PENDING -> PROCESSING
+    # claim and cleared whenever the job leaves PROCESSING.
+    #
+    # worker_id identifies the process; execution_token identifies one specific
+    # attempt by that process. A worker that stalled past its lease keeps its old
+    # token, so every write it makes afterwards matches zero rows once recovery
+    # or a new claim has moved the job on. The token is the fencing token.
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    execution_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
