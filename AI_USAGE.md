@@ -12,9 +12,11 @@ still agreed.
 - **Cursor**, with **Claude Opus 5 High** and later **Grok 4.6 High Fast** —
   implementation, tests, migrations, and in-editor review.
 
-The human (Avi) specified the architecture constraints, wrote or rewrote the
-invariants that mattered, ran the suite and the manual crash/cancel/drain
-demos, and rejected designs that only looked correct.
+I reviewed the architecture and implementation decisions, challenged
+concurrency and failure assumptions, ran final verification commands, and
+accepted or rejected proposed designs based on observed test and database
+behavior. Cursor performed much of the implementation and automated/manual
+verification under my direction.
 
 ## Where AI helped
 
@@ -70,9 +72,9 @@ database.
    `test_activation_respects_the_batch_size` failed on the first version.
 
 Other rejected proposals (heartbeat owning the handler task; rolling back a
-DB commit after a Redis timeout; treating a cancelled job as `409` on repeat)
-are recorded in git history and in review notes. They are not product
-features.
+DB commit after a Redis timeout; treating a cancelled job as 409 on repeat)
+were identified during design and implementation review. They were not kept
+in the final implementation.
 
 ## Review standard
 
@@ -80,3 +82,14 @@ Generated code was run against PostgreSQL and Redis, not against a mental
 model of them. Concurrency tests were repeated. Suggestions that could not
 be reconciled with a `WHERE` clause, a lease predicate, or a failing test
 were not kept.
+
+## What AI Struggled With
+
+The most difficult area was reasoning across failure boundaries between
+PostgreSQL, Redis, worker processes, and external side effects.
+Several designs appeared correct when each component was considered in
+isolation but exposed race conditions when crashes or concurrent operations
+were introduced. The queue ordering, stale-worker fencing, scheduler
+batching, and legacy migration examples above all required explicit
+verification against the real systems rather than relying only on generated
+reasoning.
